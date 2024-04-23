@@ -1,20 +1,4 @@
-# Copyright (C) 2023  Miguel Ángel González Santamarta
-
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-
-from typing import List, Dict
+# from typing import List, Dict
 
 import rclpy
 from rclpy.node import Node
@@ -23,52 +7,55 @@ from rclpy.qos import QoSHistoryPolicy
 from rclpy.qos import QoSDurabilityPolicy
 from rclpy.qos import QoSReliabilityPolicy
 
+import message_filters
 from cv_bridge import CvBridge
 
-from ultralytics import YOLO
-from ultralytics.engine.results import Results
-from ultralytics.engine.results import Boxes
-from ultralytics.engine.results import Masks
-from ultralytics.engine.results import Keypoints
+# from ultralytics import YOLO
+# from ultralytics.engine.results import Results
+# from ultralytics.engine.results import Boxes
+# from ultralytics.engine.results import Masks
+# from ultralytics.engine.results import Keypoints
 
 from sensor_msgs.msg import Image
-from yolov8_msgs.msg import Point2D
-from yolov8_msgs.msg import BoundingBox2D
-from yolov8_msgs.msg import Mask
-from yolov8_msgs.msg import KeyPoint2D
-from yolov8_msgs.msg import KeyPoint2DArray
 from yolov8_msgs.msg import Detection
 from yolov8_msgs.msg import DetectionArray
-from std_srvs.srv import SetBool
+from yolov8_msgs.msg import FaceID
+from yolov8_msgs.msg import FaceIDArray
 
-from faceRec.adaface import inference
+
+import sys
+# sys.path.insert(0, "/home/lee52/ros2_ws/py310/lib/python3.10/site-packages") # 우선순위 지정
+sys.path.append("/home/lee52/ros2_ws/src/yolov8_ros/faceRec")
+
+from adaface import AdaFace
 
 class AdafaceNode(Node):
-
     def __init__(self) -> None:
         super().__init__("adaface_node")
+        self.get_logger().info('Adaface is now starting...')
 
         # params
         self.declare_parameter("fr_weight", "ir_50")
-        fr_weight = self.get_parameter(
-            "fr_weight").get_parameter_value().string_value
-        
+        model = self.get_parameter("fr_weight").get_parameter_value().string_value
+
         self.declare_parameter("device", "cuda:0")
-        self.device = self.get_parameter(
-            "device").get_parameter_value().string_value
+        self.device = self.get_parameter("device").get_parameter_value().string_value
 
+        self.declare_parameter("option", 1)  
+        option = self.get_parameter("option").get_parameter_value().integer_value
+        
         self.declare_parameter("thresh", 0.2)
-        self.thresh = self.get_parameter(
-            "thresh").get_parameter_value().double_value
+        self.thresh = self.get_parameter("thresh").get_parameter_value().double_value
 
-        self.declare_parameter("max_obj", 6)
-        self.max_obj = self.get_parameter(
-            "max_obj").get_parameter_value().integer_value
+        self.declare_parameter("max_obj", 6)        
+        self.max_obj = self.get_parameter("max_obj").get_parameter_value().integer_value
 
-        self.declare_parameter("enable", True)
-        self.enable = self.get_parameter(
-            "enable").get_parameter_value().bool_value
-
+        self.declare_parameter("dataset", "face_dataset/test")  
+        self.dataset = self.get_parameter("dataset").get_parameter_value().string_value
+        
+        self.declare_parameter("video", "0")
+        self.video = self.get_parameter("video").get_parameter_value().string_value
+        
         self.declare_parameter("image_reliability",
                                QoSReliabilityPolicy.BEST_EFFORT)
         image_qos_profile = QoSProfile(
@@ -80,174 +67,67 @@ class AdafaceNode(Node):
         )
 
         self.cv_bridge = CvBridge()
-        self.yolo = YOLO(model)
-        self.yolo.fuse()
+        self.adaface = AdaFace(
+            model=model,
+            option=option,
+            dataset=self.dataset,
+            video=self.video,
+            max_obj=self.max_obj,
+            thresh=self.thresh,
+        )
+        self.get_logger().info('Adaface load suceess...')
+        # if adaface.option == 0:
+        #     adaface.store_embedding()
+        # elif adaface.option == 1:
+        #     adaface.run_video()
+        # else:
+        #     print("Error: 잘못된 argument 입력")
+        #     sys.exit(1)
 
         # pubs
-        self._pub = self.create_publisher(DetectionArray, "detections", 10)
+        self._pub = self.create_publisher(FaceIDArray, "recogntion", 10)
 
         # subs
-        self._sub = self.create_subscription(
-            Image, "image_raw", self.image_cb,
-            image_qos_profile
-        )
+        image_sub = message_filters.Subscriber(
+            self, Image, "image_raw", qos_profile=image_qos_profile)
+        # self._sub = self.create_subscription(
+        #     Image, "image_raw", self.image_cb,
+        #     image_qos_profile
+        # )
+        tracking_sub = message_filters.Subscriber(
+            self, DetectionArray, "detections", qos_profile=10)
+        
+        self._synchronizer = message_filters.ApproximateTimeSynchronizer(
+            (image_sub, tracking_sub), 10, 0.5)
+        self._synchronizer.registerCallback(self.recogntion_cb)
 
-        # services
-        self._srv = self.create_service(SetBool, "enable", self.enable_cb)
+    def recogntion_cb(self, img_msg: Image, detections_msg: DetectionArray) -> None:
+        recognized_faces_msg = FaceIDArray()
+        recognized_faces_msg.header = img_msg.header
 
-    def enable_cb(
-        self,
-        req: SetBool.Request,
-        res: SetBool.Response
-    ) -> SetBool.Response:
-        self.enable = req.data
-        res.success = True
-        return res
-
-    def parse_hypothesis(self, results: Results) -> List[Dict]:
-
-        hypothesis_list = []
-
-        box_data: Boxes
-        for box_data in results.boxes:
-            hypothesis = {
-                "class_id": int(box_data.cls),
-                "class_name": self.yolo.names[int(box_data.cls)],
-                "score": float(box_data.conf)
-            }
-            hypothesis_list.append(hypothesis)
-
-        return hypothesis_list
-
-    def parse_boxes(self, results: Results) -> List[BoundingBox2D]:
-
-        boxes_list = []
-
-        box_data: Boxes
-        for box_data in results.boxes:
-
-            msg = BoundingBox2D()
-
-            # get boxes values
-            box = box_data.xywh[0]
-            msg.center.position.x = float(box[0])
-            msg.center.position.y = float(box[1])
-            msg.size.x = float(box[2])
-            msg.size.y = float(box[3])
-
-            # append msg
-            boxes_list.append(msg)
-
-        return boxes_list
-
-    def parse_masks(self, results: Results) -> List[Mask]:
-
-        masks_list = []
-
-        def create_point2d(x: float, y: float) -> Point2D:
-            p = Point2D()
-            p.x = x
-            p.y = y
-            return p
-
-        mask: Masks
-        for mask in results.masks:
-
-            msg = Mask()
-
-            msg.data = [create_point2d(float(ele[0]), float(ele[1]))
-                        for ele in mask.xy[0].tolist()]
-            msg.height = results.orig_img.shape[0]
-            msg.width = results.orig_img.shape[1]
-
-            masks_list.append(msg)
-
-        return masks_list
-
-    def parse_keypoints(self, results: Results) -> List[KeyPoint2DArray]:
-
-        keypoints_list = []
-
-        points: Keypoints
-        for points in results.keypoints:
-
-            msg_array = KeyPoint2DArray()
-
-            if points.conf is None:
-                continue
-
-            for kp_id, (p, conf) in enumerate(zip(points.xy[0], points.conf[0])):
-
-                if conf >= self.threshold:
-                    msg = KeyPoint2D()
-
-                    msg.id = kp_id + 1 # string
-                    msg.point.x = float(p[0])
-                    msg.point.y = float(p[1])
-                    msg.score = float(conf)
-
-                    msg_array.data.append(msg)
-
-            keypoints_list.append(msg_array)
-
-        return keypoints_list
-
-    def image_cb(self, msg: Image) -> None:
-
-        if self.enable:
-
-            # convert image + predict
-            cv_image = self.cv_bridge.imgmsg_to_cv2(msg)
-            results = self.yolo.predict(
-                source=cv_image,
-                verbose=False,
-                stream=False,
-                classes=0,
-                conf=self.threshold,
-                device=self.device
-            )
-            results: Results = results[0].cpu()
-
-            if results.boxes:
-                hypothesis = self.parse_hypothesis(results)
-                boxes = self.parse_boxes(results)
-
-            if results.masks:
-                masks = self.parse_masks(results)
-
-            if results.keypoints:
-                keypoints = self.parse_keypoints(results)
-
-            # create detection msgs
-            detections_msg = DetectionArray()
-
-            for i in range(len(results)):
-
-                aux_msg = Detection()
-
-                if results.boxes:
-                    aux_msg.class_id = hypothesis[i]["class_id"]
-                    aux_msg.class_name = hypothesis[i]["class_name"]
-                    aux_msg.score = hypothesis[i]["score"]
-
-                    aux_msg.bbox = boxes[i]
-
-                if results.masks:
-                    aux_msg.mask = masks[i]
-
-                if results.keypoints:
-                    aux_msg.keypoints = keypoints[i]
-
-                detections_msg.detections.append(aux_msg)
-
-            # publish detections
-            detections_msg.header = msg.header
-            self._pub.publish(detections_msg)
-
+        # convert image
+        cv_image = self.cv_bridge.imgmsg_to_cv2(img_msg)
+        # 로그 추가
+        self.get_logger().info('Received image message: %s', img_msg)
+        self.get_logger().info('Received detections message: %s', detections_msg)
+        self.get_logger().info('Converted image to cv_image: %s', cv_image)
+        # recogntion_list = []
+        # recogntion: FaceID
+        # for detection in detections_msg.detections:
+        #     recogntion_list.append(
+        #         [
+        #             detection.bbox.center.position.x - detection.bbox.size.x / 2,
+        #             detection.bbox.center.position.y - detection.bbox.size.y / 2,
+        #             detection.bbox.center.position.x + detection.bbox.size.x / 2,
+        #             detection.bbox.center.position.y + detection.bbox.size.y / 2,
+        #             detection.score,
+        #             detection.class_id
+        #         ]
+        #     )
 
 def main():
     rclpy.init()
-    node = Yolov8Node()
+    node = AdafaceNode()
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()

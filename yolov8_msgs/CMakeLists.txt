@@ -21,6 +21,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Detection.msg"
   "msg/DetectionArray.msg"
   "msg/FaceID.msg"
+  "msg/FaceIDArray.msg"
   DEPENDENCIES std_msgs geometry_msgs
 )
 

@@ -1,9 +1,9 @@
-faceRec/face_dataset/test/minha.jpg
-faceRec/face_dataset/test/yeonju.jpg
-faceRec/face_dataset/test/jaeyeong.jpg
-faceRec/video/*.mp4
-faceRec/video/
-faceRec/pretrained/
+*/face_dataset/test/*.jpg
+*/video/*.mp4
+*/video/
+*/pretrained/
+faceRec/emebd/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
